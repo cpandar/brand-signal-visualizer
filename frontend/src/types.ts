@@ -142,10 +142,17 @@ export function parseDataMessage(buffer: ArrayBuffer): DataBatch | null {
       offset += 8
     }
 
-    const data = makeTypedArray(dtypeTag, buffer, offset, nChannels * nSamples)
+    // Slice to a new aligned ArrayBuffer — TypedArrays (Float32, Int16) require
+    // byte offset to be a multiple of their element size, which is not guaranteed
+    // at this offset in the original buffer.
+    const itemSize = [1, 2, 4, 8][dtypeTag] ?? 1
+    const byteLen = nChannels * nSamples * itemSize
+    const dataSlice = buffer.slice(offset, offset + byteLen)
+    const data = makeTypedArray(dtypeTag, dataSlice, 0, nChannels * nSamples)
 
     return { stream, field, dtypeTag, nChannels, nSamples, timestamps, data }
-  } catch {
+  } catch (err) {
+    console.error('[parseDataMessage] Failed to parse binary frame:', err)
     return null
   }
 }

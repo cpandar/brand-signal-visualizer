@@ -76,12 +76,12 @@ class ConnectionManager:
                 field_subs.discard(ws)
         logging.info('Browser client disconnected')
 
-    def subscribe(self, ws: WebSocket, stream: str, field: str):
+    def subscribe(self, ws: WebSocket, stream: str, field: str, last_id: str = '0-0'):
         self.subscriptions.setdefault(stream, {}).setdefault(field, set()).add(ws)
-        # Only reset to '$' if this stream is brand new (don't reset for new viewers
-        # on an already-polled stream)
+        # Only set last_id if this stream is brand new — don't overwrite an
+        # already-running poll cursor
         if stream not in self.last_ids:
-            self.last_ids[stream] = '$'
+            self.last_ids[stream] = last_id
         logging.info(f'Subscribed to {stream}/{field}')
 
     def unsubscribe(self, ws: WebSocket, stream: str, field: str):
@@ -229,6 +229,8 @@ class SignalVisualizerNode(BRANDNode):
         self.manager = ConnectionManager()
         # dtype cache: (stream, field) -> dtype_tag
         self._dtype_cache: Dict[tuple, int] = {}
+        self._server: Optional[uvicorn.Server] = None
+        self._shutdown = False
 
     # ------------------------------------------------------------------
     # Graph YAML helpers
@@ -251,8 +253,6 @@ class SignalVisualizerNode(BRANDNode):
     # ------------------------------------------------------------------
 
     def _suggest_viewer(self, dtype_str: str, n_channels: int) -> str:
-        if n_channels == 1:
-            return 'gauge'
         if n_channels <= 16:
             return 'timeseries'
         if dtype_str in ('int8', 'int16'):
@@ -339,7 +339,7 @@ class SignalVisualizerNode(BRANDNode):
         r = self.r  # redis-py client (sync) — acceptable in asyncio with care
         manager = self.manager
 
-        while True:
+        while not self._shutdown:
             t_start = asyncio.get_event_loop().time()
 
             active = manager.active_streams()
@@ -429,7 +429,17 @@ class SignalVisualizerNode(BRANDNode):
             stream = msg.get('stream', '')
             field = msg.get('field', '')
             if stream and field:
-                self.manager.subscribe(ws, stream, field)
+                # Resolve the current last entry ID so the polling loop starts
+                # from "now" rather than replaying all history. Using '$' with
+                # non-blocking XREAD always returns nothing; we need the actual ID.
+                last_id = '0-0'
+                try:
+                    entries = self.r.xrevrange(stream, '+', '-', count=1)
+                    if entries:
+                        last_id = entries[0][0].decode()
+                except Exception:
+                    pass
+                self.manager.subscribe(ws, stream, field, last_id=last_id)
                 await ws.send_json({'type': 'subscribed', 'stream': stream, 'field': field})
         elif mtype == 'unsubscribe':
             stream = msg.get('stream', '')
@@ -443,6 +453,12 @@ class SignalVisualizerNode(BRANDNode):
     # Entry point
     # ------------------------------------------------------------------
 
+    def terminate(self, sig, frame):
+        logging.info('SIGINT received, shutting down signal_visualizer')
+        self._shutdown = True
+        if self._server:
+            self._server.should_exit = True
+
     async def _async_main(self):
         self._load_display_hints()
         app = self._build_app()
@@ -452,7 +468,8 @@ class SignalVisualizerNode(BRANDNode):
             port=self.port,
             log_level='warning',
         )
-        server = uvicorn.Server(config)
+        self._server = uvicorn.Server(config)
+        server = self._server
         logging.info(f'signal_visualizer listening on http://localhost:{self.port}')
         await asyncio.gather(
             server.serve(),

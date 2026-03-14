@@ -35,6 +35,7 @@ export function useWebSocket(): UseWebSocketReturn {
     wsRef.current = ws
 
     ws.onopen = () => {
+      console.info('[WS] Connected to', WS_URL)
       setStatus('connected')
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current)
@@ -43,11 +44,13 @@ export function useWebSocket(): UseWebSocketReturn {
     }
 
     ws.onclose = () => {
+      console.warn('[WS] Disconnected — reconnecting in', RECONNECT_DELAY_MS, 'ms')
       setStatus('disconnected')
       reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS)
     }
 
-    ws.onerror = () => {
+    ws.onerror = (ev) => {
+      console.error('[WS] Error:', ev)
       ws.close()
     }
 
@@ -57,10 +60,11 @@ export function useWebSocket(): UseWebSocketReturn {
         try {
           const msg = JSON.parse(ev.data) as InboundJsonMsg
           if (msg.type === 'manifest') {
+            console.info('[WS] Manifest received —', Object.keys(msg.streams).length, 'streams')
             setManifest(msg.streams)
           }
-        } catch {
-          console.warn('Failed to parse JSON message', ev.data)
+        } catch (err) {
+          console.warn('[WS] Failed to parse JSON message:', err, ev.data)
         }
       } else if (ev.data instanceof ArrayBuffer) {
         // Binary data message
@@ -68,9 +72,14 @@ export function useWebSocket(): UseWebSocketReturn {
         if (batch) {
           const key = `${batch.stream}/${batch.field}`
           const handlers = dataHandlers.current.get(key)
-          if (handlers) {
+          if (handlers && handlers.size > 0) {
             handlers.forEach(h => h(batch))
+          } else {
+            console.warn('[WS] Binary frame received for', key, 'but no handlers registered')
           }
+        } else {
+          console.error('[WS] Binary frame received but parseDataMessage returned null',
+            '— buffer size:', ev.data.byteLength)
         }
       }
     }

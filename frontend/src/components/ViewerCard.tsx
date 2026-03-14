@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { DataBatch, ViewerConfig, ViewerType } from '../types'
 import { TimeSeriesViewer } from '../viewers/TimeSeriesViewer'
 import { RasterViewer } from '../viewers/RasterViewer'
+import { HeatmapViewer } from '../viewers/HeatmapViewer'
 
 const VIEWER_LABELS: Record<ViewerType, string> = {
   timeseries: 'Time Series',
@@ -23,9 +24,13 @@ interface Props {
   ) => () => void
 }
 
+const WINDOW_OPTIONS = [1, 2, 5, 10, 30]
+const DEFAULT_WINDOW_SECS = 5
+
 export function ViewerCard({ config, onRemove, onTypeChange, registerDataHandler }: Props) {
   const [latestBatch, setLatestBatch] = useState<DataBatch | null>(null)
   const [showTypeMenu, setShowTypeMenu] = useState(false)
+  const [windowSecs, setWindowSecs] = useState(DEFAULT_WINDOW_SECS)
 
   useEffect(() => {
     const unsub = registerDataHandler(config.stream, config.field, (batch) => {
@@ -47,11 +52,11 @@ export function ViewerCard({ config, onRemove, onTypeChange, registerDataHandler
   function renderViewer() {
     switch (config.viewerType) {
       case 'timeseries':
-        return <TimeSeriesViewer config={config} latestBatch={latestBatch} />
+        return <TimeSeriesViewer config={config} latestBatch={latestBatch} windowSecs={windowSecs} />
       case 'raster':
         return <RasterViewer config={config} latestBatch={latestBatch} />
       case 'heatmap':
-        return <PlaceholderViewer label="Heatmap (coming soon)" />
+        return <HeatmapViewer config={config} latestBatch={latestBatch} windowSecs={windowSecs} />
       case 'scatter':
         return <PlaceholderViewer label="2D Scatter (coming soon)" />
       case 'gauge':
@@ -72,6 +77,19 @@ export function ViewerCard({ config, onRemove, onTypeChange, registerDataHandler
           </span>
         </div>
         <div style={styles.controls}>
+          {/* Timescale selector — relevant for time series and heatmap */}
+          {(config.viewerType === 'timeseries' || config.viewerType === 'heatmap') && (
+            <select
+              style={styles.windowSelect}
+              value={windowSecs}
+              onChange={e => setWindowSecs(Number(e.target.value))}
+              title="Time window"
+            >
+              {WINDOW_OPTIONS.map(s => (
+                <option key={s} value={s}>{s}s</option>
+              ))}
+            </select>
+          )}
           {/* Viewer type switcher */}
           <div style={{ position: 'relative' }}>
             <button
@@ -152,6 +170,10 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: 'left', cursor: 'pointer', fontSize: 13,
   },
   typeMenuItemActive: { color: '#89b4fa', fontWeight: 600 },
+  windowSelect: {
+    background: '#313244', color: '#a6adc8', border: '1px solid #45475a',
+    borderRadius: 5, padding: '3px 6px', cursor: 'pointer', fontSize: 12,
+  },
   closeBtn: {
     background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
     fontSize: 14, padding: '2px 6px', borderRadius: 4,

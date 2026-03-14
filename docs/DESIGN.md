@@ -76,8 +76,18 @@ No streams are polled if no browser is connected, and only streams with active v
 are included in each poll. When the last viewer for a stream is closed, that stream
 is dropped from the poll list immediately.
 
-**Wire format:** Binary (MessagePack or raw ArrayBuffers) rather than JSON for
-multi-channel data. See ADR-003.
+**Wire format:** Raw binary ArrayBuffers sent over WebSocket. Message layout:
+```
+type(1B) | stream_len(1B) | stream(N) | field_len(1B) | field(M) |
+dtype_tag(1B) | n_channels(4B LE) | n_samples(4B LE) |
+timestamps(n×8B uint64 LE, ms since epoch) | data(channels-first row-major)
+```
+Timestamps from Redis stream IDs are ms-precision uint64; the frontend converts to
+seconds. Data is channels-first row-major (`data[ch * n_samples + s]`). See ADR-003.
+
+**SIGINT shutdown:** The node overrides `terminate()` to set `server.should_exit = True`
+and a `_shutdown` flag checked by the polling loop, allowing clean asyncio teardown
+instead of the default `sys.exit(0)` which causes SIGKILL from the BRAND supervisor.
 
 **Configuration (graph YAML `parameters` block):**
 ```yaml
@@ -103,6 +113,7 @@ so users do not need `npm` to run the node. `npm` is a dev-time dependency only.
 
 **Dashboard:** A free-form grid of viewer cards. Each card has:
 - A header showing stream name, field, current sample rate, and viewer type selector
+- A timescale dropdown (1 / 2 / 5 / 10 / 30 s) for time-series and heatmap viewers
 - The visualization area
 - A close button
 
@@ -119,19 +130,61 @@ so users do not need `npm` to run the node. `npm` is a dev-time dependency only.
 
 | Type | Compatible when | Default for |
 |---|---|---|
-| Time series | Any signal, ≤ ~16 channels | 1–16 ch float or int |
+| Time series | Any signal, ≤ 16 channels | 1–16 ch float or int |
 | Raster | Multi-channel, int/binary-ish | > 16 ch int8/int16 |
 | Heatmap | Multi-channel, continuous | > 16 ch float |
 | Scatter / 2D | Exactly 2 channels, continuous | — (optional override) |
-| Gauge | Any, 1 channel | — (optional override) |
+| Gauge | Any, 1 channel | — (optional override, not yet implemented) |
 
 Viewer type is determined by signal shape and dtype — **never by stream name**.
 Switching type is a frontend-only operation with no backend round-trip.
 
 **Charting libraries:**
-- Time series and scatter: [uPlot](https://github.com/leeoniya/uPlot) — purpose-built
-  for high-frequency time series, handles large typed arrays at 60 fps efficiently
-- Raster and heatmap: direct Canvas 2D API rendering for performance
+- Time series: [uPlot](https://github.com/leeoniya/uPlot) — purpose-built for
+  high-frequency time series, handles large typed arrays at 60 fps efficiently
+- Raster and heatmap: direct Canvas 2D API with `putImageData` for performance
+
+---
+
+## Viewer Implementation Notes
+
+### Time Series Viewer
+
+Uses uPlot with a `scales.x.range` function that always displays exactly `windowSecs`
+of data anchored to the latest sample. The range function reads from a mutable ref
+(`windowSecsRef`) so the timescale dropdown updates take effect immediately without
+destroying and re-creating the uPlot instance.
+
+The data buffer retains up to `MAX_BUFFER_SECS = 60` seconds of history (hard cap
+derived from `approx_rate_hz × 60 × 1.5` to accommodate high-rate streams like
+1000 Hz neural data). This means switching to a wider time window reveals real past
+data rather than an empty plot.
+
+### Raster Viewer
+
+Canvas 2D rendering with a `requestAnimationFrame` loop. Stores events as
+`{ ts, ch }` pairs; renders dots at `(x, y)` coordinates mapped from time and channel.
+Suitable for sparse binary spike trains on > 16 channels.
+
+### Heatmap Viewer
+
+Canvas 2D rendering with `putImageData` for efficient pixel-level control. Each
+time column maps to one or more canvas pixel columns; each channel maps to
+`pxPerCh` rows (`max(1, floor(200 / n_channels))` so total height ≈ 200 px
+regardless of channel count).
+
+**Colormaps:**
+- Default (raw mode): Plasma (dark purple → orange → yellow, 0 = low, max = bright)
+- Demeaned mode: Diverging RdBu (blue = below mean, white = zero, red = above mean)
+
+**Demeaning ("Δ mean" toggle):** A per-channel 10-second exponential moving average
+(EMA) is maintained continuously. When the toggle is active, `value − EMA` is
+displayed using the diverging colormap, making channel-to-channel firing rate
+modulations visible even when baseline rates differ substantially across channels.
+EMA is initialized to the first sample's values to avoid a slow warmup transient.
+
+The adaptive color scale decays slowly (`rangeMax * 0.98 + dataMax * 0.02`) to
+prevent the display from flashing when occasional outlier values occur.
 
 ---
 
@@ -190,27 +243,36 @@ The display node is designed to be a **rate-limited passive observer**:
 
 ---
 
-## MVP Scope
+## Implementation Status
 
-- [ ] Python node: FastAPI server, WebSocket endpoint, Redis polling loop
-- [ ] Stream manifest endpoint (auto-discover available streams on connect)
-- [ ] Time series viewer (uPlot, scrolling window, configurable duration)
-- [ ] Raster viewer (Canvas 2D, configurable time window)
-- [ ] Add/remove viewers dynamically
-- [ ] Viewer type toggle (frontend only)
-- [ ] `display_hints` parsing from graph YAML
-- [ ] macOS + Linux support (follows patterns established in brand-tutorial porting)
-- [ ] Pre-built React bundle committed to repo
+### Completed ✓
 
-## Future / Post-MVP
+- Python node: FastAPI + asyncio server, WebSocket endpoint, Redis polling loop
+- Stream manifest: auto-discovers all Redis streams on connect, infers dtype/shape/rate
+- Binary wire format with correct TypedArray alignment (buffer-slice before view construction)
+- Time series viewer (uPlot, scrolling window, timescale dropdown 1–30 s, 60 s history buffer)
+- Raster viewer (Canvas 2D, scrolling spike-dot plot)
+- Heatmap viewer (Canvas 2D `putImageData`, plasma colormap, per-channel EMA demeaning toggle)
+- Add/remove viewers dynamically
+- Viewer type toggle (frontend only, no backend round-trip)
+- `display_hints` parsing from graph YAML
+- macOS + Linux support
+- Pre-built React bundle committed to repo (`nodes/signal_visualizer/static/`)
+- SIGINT clean shutdown (no SIGKILL from supervisor)
+- Added as a git submodule in `brand-tutorial/brand-modules/brand-signal-visualizer`
+- Environment YAML dependencies: `fastapi>=0.100.0`, `uvicorn[standard]>=0.23.0`
+- Shell launcher `.bin` file (skips Cython compilation step)
 
-- Heatmap viewer
-- Scatter / 2D viewer
-- Gauge viewer
-- Viewer layout persistence (survive browser refresh)
-- Data backfill on viewer open (last N seconds from Redis stream history)
-- Remote Redis support (separate machine monitoring)
-- npm-based build step integrated into repo Makefile
+### Known Limitations / Post-MVP
+
+- **Scatter / 2D viewer**: placeholder only ("coming soon")
+- **Gauge viewer**: placeholder only ("coming soon")
+- **Multi-field viewers**: each viewer card subscribes to a single stream field;
+  overlaying multiple fields in one card is not yet supported
+- **Data backfill on viewer open**: new viewers show only live data from the moment
+  they are added; no historical replay from Redis stream history
+- **Viewer layout persistence**: configured viewers are lost on browser refresh
+- **Remote Redis**: `redis_host` parameter exists but is untested across machines
 
 ---
 
@@ -220,8 +282,8 @@ The display node is designed to be a **rate-limited passive observer**:
   historical data from the Redis stream (Redis stores a configurable history), or only
   live data going forward? Backfill improves usability but adds complexity.
 - **Viewer state persistence**: Should configured viewers survive a browser refresh?
-  (Browser `localStorage` is available since this is a standalone app, not an artifact.)
+  (`localStorage` is available since this is a standalone app, not an artifact.)
+- **Multi-field viewers**: Allow a single time series card to overlay multiple fields
+  from the same stream (e.g. both `vel_x` and `vel_y` on one plot)?
 - **npm as dev dependency**: Is npm acceptable as a requirement for frontend development?
   The pre-built bundle avoids it at runtime, but contributors modifying the frontend need it.
-- **Repo location**: Standalone `brandbci/brand-signal-visualizer` repo (preferred) vs
-  adding to an existing `brand-modules` repo.
