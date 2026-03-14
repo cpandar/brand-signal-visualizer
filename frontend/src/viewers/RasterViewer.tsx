@@ -27,7 +27,6 @@ export function RasterViewer({ config, latestBatch }: Props) {
     if (!latestBatch) return
 
     const events = eventsRef.current
-    const fieldB = config.field.length  // used to index data
 
     for (let s = 0; s < latestBatch.nSamples; s++) {
       const ts = latestBatch.timestamps[s]

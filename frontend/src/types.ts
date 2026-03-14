@@ -142,7 +142,6 @@ export function parseDataMessage(buffer: ArrayBuffer): DataBatch | null {
       offset += 8
     }
 
-    const itemSize = [1, 2, 4, 8][dtypeTag] ?? 1
     const data = makeTypedArray(dtypeTag, buffer, offset, nChannels * nSamples)
 
     return { stream, field, dtypeTag, nChannels, nSamples, timestamps, data }

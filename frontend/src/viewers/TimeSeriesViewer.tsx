@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
-import { DataBatch, ViewerConfig, channelSlice } from '../types'
+import { DataBatch, ViewerConfig } from '../types'
 
 const WINDOW_S = 5       // seconds of history to display
 const MAX_POINTS = 2000  // max samples retained per channel
