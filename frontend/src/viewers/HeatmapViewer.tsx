@@ -23,20 +23,18 @@ const PLASMA_LUT = buildLUT([
 ])
 
 // ---------------------------------------------------------------------------
-// Diverging Coolwarm LUT — Moreland 2009 (blue=below mean, red=above mean)
-// Soft warm-gray neutral avoids the harsh white flash of RdBu; muted tones
-// are much easier to look at for extended periods.
+// Diverging dark-center LUT — dark neutral blends into the UI background;
+// deviations glow outward (blue = below mean, red = above mean).
+// Inspired by cmocean "fusion" / Crameri "vik" but with a near-black pivot.
 // ---------------------------------------------------------------------------
-const COOLWARM_LUT = buildLUT([
-  [0.00,  59,  76, 192],   // muted blue        (−max deviation)
-  [0.15,  95, 125, 220],   //
-  [0.30, 138, 168, 234],   // soft periwinkle
-  [0.42, 183, 203, 243],   // pale blue
-  [0.50, 221, 220, 219],   // warm gray          (zero deviation)
-  [0.58, 244, 196, 170],   // pale apricot
-  [0.70, 235, 147, 105],   // soft salmon
-  [0.85, 209,  80,  54],   //
-  [1.00, 180,   4,  38],   // muted red          (+max deviation)
+const FUSION_LUT = buildLUT([
+  [0.00,  30, 140, 255],   // bright azure        (−max deviation)
+  [0.18,  20,  85, 185],   // medium blue
+  [0.35,  20,  38,  90],   // dark indigo
+  [0.50,  22,  22,  36],   // near-black (≈ UI bg) (zero deviation)
+  [0.65,  90,  18,  28],   // dark crimson
+  [0.82, 200,  45,  40],   // medium red
+  [1.00, 250,  80,  60],   // bright red-orange   (+max deviation)
 ])
 
 function buildLUT(stops: [number, number, number, number][]): Uint8Array {
@@ -183,7 +181,7 @@ export function HeatmapViewer({ config, registerDataHandler, windowSecs = 5 }: P
       const winS       = windowSecsRef.current
       const W   = canvas!.width
       const H   = canvas!.height
-      const lut = isDemeaned ? COOLWARM_LUT : PLASMA_LUT
+      const lut = isDemeaned ? FUSION_LUT : PLASMA_LUT
 
       ctx.fillStyle = '#181825'
       ctx.fillRect(0, 0, W, H)
