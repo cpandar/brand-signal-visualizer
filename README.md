@@ -6,6 +6,10 @@ Runs as a standard BRAND graph node. Open `http://localhost:8765` in any browser
 a graph is running to monitor live signals and inspect graph structure without adding
 meaningful overhead to the graph.
 
+<img src="docs/images/signals-view.png" alt="Signal viewer showing live raster and time series plots" width="900">
+
+<img src="docs/images/graph-view.png" alt="Graph view showing node topology with stream freshness indicators" width="900">
+
 ## Quick start
 
 ### 1. Add to your graph YAML
