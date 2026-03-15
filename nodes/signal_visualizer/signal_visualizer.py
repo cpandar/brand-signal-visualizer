@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set
 
 import numpy as np
+import yaml
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -241,10 +242,20 @@ class SignalVisualizerNode(BRANDNode):
         try:
             entries = self.r.xrange('supergraph_stream', '-', '+', count=1)
             if entries:
-                data = json.loads(entries[-1][1][b'data'].decode())
-                self.display_hints = data.get('display_hints', {})
-                logging.info(f'Loaded display_hints for streams: '
-                             f'{list(self.display_hints.keys())}')
+                raw = entries[-1][1].get(b'data')
+                if raw is None:
+                    return
+                text = raw.decode('utf-8')
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, str):
+                        data = yaml.safe_load(data)
+                except json.JSONDecodeError:
+                    data = yaml.safe_load(text)
+                if isinstance(data, dict):
+                    self.display_hints = data.get('display_hints', {})
+                    logging.info(f'Loaded display_hints for streams: '
+                                 f'{list(self.display_hints.keys())}')
         except Exception as e:
             logging.warning(f'Could not load display_hints: {e}')
 
@@ -420,6 +431,177 @@ class SignalVisualizerNode(BRANDNode):
 
         return app
 
+    # ------------------------------------------------------------------
+    # Graph topology
+    # ------------------------------------------------------------------
+
+    def _find_stream_refs(self, params: object, known_streams: set) -> dict:
+        """
+        Recursively walk a parameters object and collect values that match
+        known Redis stream names. Uses the parameter key name as a
+        directional hint (in/out) when possible.
+        """
+        in_streams: list = []
+        out_streams: list = []
+
+        IN_HINTS  = ('in_', 'input', 'read', 'source', 'from', 'listen')
+        OUT_HINTS = ('out_', 'output', 'write', 'dest', 'sink', 'publish', 'send')
+
+        def walk(obj, key: str = ''):
+            key_l = key.lower()
+            if isinstance(obj, str) and obj in known_streams:
+                if any(h in key_l for h in OUT_HINTS):
+                    out_streams.append(obj)
+                elif any(h in key_l for h in IN_HINTS):
+                    in_streams.append(obj)
+                else:
+                    # Ambiguous key — add to both; cross-node pass will resolve
+                    in_streams.append(obj)
+                    out_streams.append(obj)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item, key)
+            elif isinstance(obj, dict):
+                for k, v in obj.items():
+                    walk(v, k)
+
+        walk(params)
+        return {'in': in_streams, 'out': out_streams}
+
+    def _build_graph_topology(self) -> dict:
+        """
+        Build a graph topology snapshot from supergraph_stream and live Redis streams.
+        Returns a dict compatible with the graph_topology WebSocket message.
+        """
+        topology: dict = {'nodes': [], 'edges': [], 'streams': {}}
+
+        # 1. Read supergraph YAML from Redis
+        logging.info('[get_graph] Reading supergraph_stream …')
+        try:
+            entries = self.r.xrange('supergraph_stream', '-', '+', count=1)
+            if not entries:
+                logging.warning('supergraph_stream is empty — graph topology unavailable')
+                return topology
+            raw = entries[-1][1].get(b'data')
+            if raw is None:
+                # Fall back to first available field
+                raw = next(iter(entries[-1][1].values()), None)
+            if raw is None:
+                return topology
+            # BRAND supervisor may store the supergraph in several formats:
+            #   (a) JSON-encoded dict  → json.loads returns dict directly
+            #   (b) JSON-encoded str of YAML text → json.loads returns str, then yaml.safe_load
+            #   (c) Raw YAML bytes → json.loads throws, fall back to yaml.safe_load
+            text = raw.decode('utf-8')
+            try:
+                graph_data = json.loads(text)
+                if isinstance(graph_data, str):
+                    # Case (b): double-encoded — json gave us the YAML text
+                    graph_data = yaml.safe_load(graph_data)
+            except json.JSONDecodeError:
+                # Case (c): raw YAML
+                graph_data = yaml.safe_load(text)
+            if not isinstance(graph_data, dict):
+                logging.error(f'supergraph_stream data parsed to unexpected type: '
+                              f'{type(graph_data)}')
+                return topology
+        except Exception as e:
+            logging.error(f'Could not read supergraph_stream: {e}')
+            return topology
+
+        # 2. Enumerate all live Redis streams
+        known_streams: set = set()
+        try:
+            for key in self.r.keys('*'):
+                k = key.decode('utf-8')
+                try:
+                    if self.r.type(key).decode() == 'stream':
+                        known_streams.add(k)
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.warning(f'Could not enumerate Redis streams: {e}')
+
+        logging.info(f'[get_graph] supergraph_stream OK — '
+                     f'top-level keys: {list(graph_data.keys())}')
+
+        # 3. Build stream schemas (reuse manifest logic, suppresses SKIP_STREAMS)
+        logging.info('[get_graph] Building manifest …')
+        topology['streams'] = self._build_manifest()
+        logging.info(f'[get_graph] Manifest built — {len(topology["streams"])} streams')
+
+        # 4. First pass — collect stream refs per node
+        nodes_raw = graph_data.get('nodes', [])
+        if nodes_raw is None:
+            nodes_raw = []
+        logging.info(f'[get_graph] nodes_raw type={type(nodes_raw).__name__}, '
+                     f'len={len(nodes_raw) if hasattr(nodes_raw, "__len__") else "N/A"}')
+        if nodes_raw and not isinstance(nodes_raw, list):
+            logging.warning(f'[get_graph] nodes_raw is not a list — '
+                            f'value preview: {str(nodes_raw)[:200]}')
+            nodes_raw = list(nodes_raw.values()) if isinstance(nodes_raw, dict) else []
+
+        node_refs: dict = {}
+        for i, node in enumerate(nodes_raw):
+            if not isinstance(node, dict):
+                logging.warning(f'[get_graph] node[{i}] is {type(node).__name__}, '
+                                f'not dict — skipping. Value: {str(node)[:100]}')
+                continue
+            nickname = node.get('nickname') or node.get('name', '')
+            params   = node.get('parameters') or {}
+            refs     = self._find_stream_refs(params, known_streams)
+            node_refs[nickname] = refs
+
+        # 5. Cross-node resolution pass
+        # If stream S appears unambiguously as output of any node, remove it
+        # from 'in' lists where it was only found due to ambiguous key names.
+        definite_outputs: set = set()
+        for refs in node_refs.values():
+            for s in refs.get('out', []):
+                definite_outputs.add(s)
+
+        # 6. Build node records
+        for node in nodes_raw:
+            if not isinstance(node, dict):
+                continue
+            nickname = node.get('nickname') or node.get('name', '')
+            params   = node.get('parameters') or {}
+            refs     = node_refs.get(nickname, {'in': [], 'out': []})
+
+            # Deduplicate, preserving order
+            in_s  = list(dict.fromkeys(refs.get('in',  [])))
+            out_s = list(dict.fromkeys(refs.get('out', [])))
+
+            topology['nodes'].append({
+                'nickname':     nickname,
+                'name':         node.get('name', nickname),
+                'module':       node.get('module', ''),
+                'machine':      node.get('machine') or '',
+                'run_priority': node.get('run_priority', 0),
+                'in_streams':   in_s,
+                'out_streams':  out_s,
+                'parameters':   params,
+            })
+
+        # 7. Build edges: A → stream → B when stream is in A's out AND B's in
+        seen: set = set()
+        for node_a in topology['nodes']:
+            for stream in node_a['out_streams']:
+                for node_b in topology['nodes']:
+                    if node_b['nickname'] == node_a['nickname']:
+                        continue
+                    if stream in node_b['in_streams']:
+                        key = (node_a['nickname'], node_b['nickname'], stream)
+                        if key not in seen:
+                            topology['edges'].append({
+                                'from':   node_a['nickname'],
+                                'to':     node_b['nickname'],
+                                'stream': stream,
+                            })
+                            seen.add(key)
+
+        return topology
+
     async def _handle_message(self, ws: WebSocket, msg: dict):
         mtype = msg.get('type')
         if mtype == 'get_manifest':
@@ -446,6 +628,28 @@ class SignalVisualizerNode(BRANDNode):
             field = msg.get('field', '')
             if stream and field:
                 self.manager.unsubscribe(ws, stream, field)
+        elif mtype == 'get_graph':
+            try:
+                topo = self._build_graph_topology()
+                logging.info(f'[get_graph] Built topology: '
+                             f'{len(topo["nodes"])} nodes, {len(topo["edges"])} edges')
+                # Use json.dumps + send_text to avoid FastAPI's encoder choking on
+                # any numpy-derived integers that may slip through from manifest
+                payload = json.dumps({'type': 'graph_topology', **topo},
+                                     default=lambda o: int(o) if hasattr(o, '__index__')
+                                     else float(o) if hasattr(o, '__float__')
+                                     else str(o))
+                await ws.send_text(payload)
+                logging.info('[get_graph] graph_topology sent successfully')
+            except Exception as e:
+                logging.error(f'[get_graph] Failed to build/send graph topology: {e}',
+                              exc_info=True)
+                try:
+                    await ws.send_json({'type': 'graph_topology',
+                                        'nodes': [], 'edges': [], 'streams': {},
+                                        'error': str(e)})
+                except Exception:
+                    pass
         else:
             logging.warning(f'Unknown message type: {mtype}')
 

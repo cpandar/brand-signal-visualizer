@@ -69,7 +69,8 @@ export interface GetManifestMsg { type: 'get_manifest' }
 export interface SubscribeMsg   { type: 'subscribe';   stream: string; field: string }
 export interface UnsubscribeMsg { type: 'unsubscribe'; stream: string; field: string }
 
-export type OutboundMsg = GetManifestMsg | SubscribeMsg | UnsubscribeMsg
+export interface GetGraphMsg    { type: 'get_graph' }
+export type OutboundMsg = GetManifestMsg | SubscribeMsg | UnsubscribeMsg | GetGraphMsg
 
 // ---------------------------------------------------------------------------
 // WebSocket message types received FROM backend
@@ -85,7 +86,8 @@ export interface SubscribedMsg {
   field: string
 }
 
-export type InboundJsonMsg = ManifestMsg | SubscribedMsg
+export interface GraphTopologyMsg extends GraphTopology { type: 'graph_topology' }
+export type InboundJsonMsg = ManifestMsg | SubscribedMsg | GraphTopologyMsg
 
 // ---------------------------------------------------------------------------
 // Dtype helpers
@@ -155,4 +157,31 @@ export function parseDataMessage(buffer: ArrayBuffer): DataBatch | null {
     console.error('[parseDataMessage] Failed to parse binary frame:', err)
     return null
   }
+}
+
+// ---------------------------------------------------------------------------
+// Graph topology types
+// ---------------------------------------------------------------------------
+
+export interface GraphNode {
+  nickname:     string
+  name:         string
+  module:       string
+  machine:      string   // hostname/IP of the machine running this node; '' = local
+  run_priority: number
+  in_streams:   string[]
+  out_streams:  string[]
+  parameters:   Record<string, unknown>
+}
+
+export interface GraphEdge {
+  from:   string
+  to:     string
+  stream: string
+}
+
+export interface GraphTopology {
+  nodes:   GraphNode[]
+  edges:   GraphEdge[]
+  streams: StreamManifest
 }

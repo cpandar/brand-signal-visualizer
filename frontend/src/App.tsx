@@ -1,15 +1,18 @@
 import { useCallback, useState } from 'react'
 import { AddViewerDialog } from './components/AddViewerDialog'
 import { ViewerCard } from './components/ViewerCard'
+import { GraphPage } from './pages/GraphPage'
 import { useWebSocket } from './hooks/useWebSocket'
 import { ViewerConfig, ViewerType } from './types'
 
 let nextId = 1
+type Page = 'signals' | 'graph'
 
 export function App() {
-  const { status, manifest, send, onData } = useWebSocket()
-  const [viewers, setViewers] = useState<ViewerConfig[]>([])
-  const [showAddDialog, setShowAddDialog] = useState(false)
+  const { status, manifest, topology, topologyLoading, send, requestGraph, onData } = useWebSocket()
+  const [viewers,        setViewers]        = useState<ViewerConfig[]>([])
+  const [showAddDialog,  setShowAddDialog]  = useState(false)
+  const [activePage,     setActivePage]     = useState<Page>('signals')
 
   function handleAddViewer(partial: Omit<ViewerConfig, 'id'>) {
     const config: ViewerConfig = { ...partial, id: String(nextId++) }
@@ -20,8 +23,7 @@ export function App() {
   function handleRemoveViewer(id: string) {
     const viewer = viewers.find(v => v.id === id)
     if (viewer) {
-      // Unsubscribe only if no other viewer uses the same stream/field
-      const others = viewers.filter(v => v.id !== id)
+      const others      = viewers.filter(v => v.id !== id)
       const stillNeeded = others.some(
         v => v.stream === viewer.stream && v.field === viewer.field
       )
@@ -38,47 +40,76 @@ export function App() {
 
   const registerDataHandler = useCallback(onData, [onData])
 
-  const statusColor = status === 'connected' ? '#a6e3a1' : status === 'connecting' ? '#f9e2af' : '#f38ba8'
+  const statusColor = status === 'connected'    ? '#a6e3a1'
+                    : status === 'connecting'   ? '#f9e2af'
+                    : '#f38ba8'
 
   return (
     <div style={styles.root}>
       {/* Top bar */}
       <div style={styles.topbar}>
-        <span style={styles.logo}>BRAND Signal Visualizer</span>
+        <span style={styles.logo}>BRAND Monitor</span>
+
+        {/* Tab bar */}
+        <div style={styles.tabs}>
+          <button
+            style={{ ...styles.tab, ...(activePage === 'signals' ? styles.tabActive : {}) }}
+            onClick={() => setActivePage('signals')}
+          >
+            Signals
+          </button>
+          <button
+            style={{ ...styles.tab, ...(activePage === 'graph' ? styles.tabActive : {}) }}
+            onClick={() => setActivePage('graph')}
+          >
+            Graph
+          </button>
+        </div>
+
         <div style={styles.topbarRight}>
           <span style={{ ...styles.statusDot, background: statusColor }} />
           <span style={styles.statusLabel}>{status}</span>
-          <button
-            style={styles.addBtn}
-            onClick={() => setShowAddDialog(true)}
-            disabled={status !== 'connected' || Object.keys(manifest).length === 0}
-          >
-            + Add Viewer
-          </button>
+          {activePage === 'signals' && (
+            <button
+              style={styles.addBtn}
+              onClick={() => setShowAddDialog(true)}
+              disabled={status !== 'connected' || Object.keys(manifest).length === 0}
+            >
+              + Add Viewer
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Viewer grid */}
-      <div style={styles.grid}>
-        {viewers.length === 0 && (
-          <div style={styles.empty}>
-            {status === 'connected'
-              ? Object.keys(manifest).length === 0
-                ? 'No streams found. Is the graph running?'
-                : 'Click "+ Add Viewer" to start monitoring a signal.'
-              : 'Connecting to BRAND node…'}
-          </div>
-        )}
-        {viewers.map(cfg => (
-          <ViewerCard
-            key={cfg.id}
-            config={cfg}
-            onRemove={handleRemoveViewer}
-            onTypeChange={handleTypeChange}
-            registerDataHandler={registerDataHandler}
-          />
-        ))}
-      </div>
+      {/* Page content */}
+      {activePage === 'signals' ? (
+        <div style={styles.grid}>
+          {viewers.length === 0 && (
+            <div style={styles.empty}>
+              {status === 'connected'
+                ? Object.keys(manifest).length === 0
+                  ? 'No streams found. Is the graph running?'
+                  : 'Click "+ Add Viewer" to start monitoring a signal.'
+                : 'Connecting to BRAND node…'}
+            </div>
+          )}
+          {viewers.map(cfg => (
+            <ViewerCard
+              key={cfg.id}
+              config={cfg}
+              onRemove={handleRemoveViewer}
+              onTypeChange={handleTypeChange}
+              registerDataHandler={registerDataHandler}
+            />
+          ))}
+        </div>
+      ) : (
+        <GraphPage
+          topology={topology}
+          topologyLoading={topologyLoading}
+          requestGraph={requestGraph}
+        />
+      )}
 
       {/* Add viewer dialog */}
       {showAddDialog && (
@@ -98,12 +129,20 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily: 'system-ui, sans-serif', display: 'flex', flexDirection: 'column',
   },
   topbar: {
-    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-    padding: '12px 20px', background: '#1e1e2e', borderBottom: '1px solid #313244',
+    display: 'flex', alignItems: 'center', gap: 0,
+    padding: '0 20px', height: 48, background: '#1e1e2e',
+    borderBottom: '1px solid #313244', flexShrink: 0,
   },
-  logo: { fontWeight: 700, fontSize: 16, color: '#89b4fa', letterSpacing: 0.5 },
+  logo: { fontWeight: 700, fontSize: 16, color: '#89b4fa', letterSpacing: 0.5, marginRight: 24 },
+  tabs: { display: 'flex', gap: 2, flex: 1 },
+  tab: {
+    background: 'none', border: 'none', borderBottom: '2px solid transparent',
+    color: '#6c7086', padding: '0 16px', height: 48, cursor: 'pointer',
+    fontSize: 13, fontWeight: 500, transition: 'color 0.15s',
+  },
+  tabActive: { color: '#89b4fa', borderBottomColor: '#89b4fa' },
   topbarRight: { display: 'flex', alignItems: 'center', gap: 10 },
-  statusDot: { width: 8, height: 8, borderRadius: '50%', display: 'inline-block' },
+  statusDot:   { width: 8, height: 8, borderRadius: '50%', display: 'inline-block' },
   statusLabel: { color: '#a6adc8', fontSize: 13 },
   addBtn: {
     background: '#89b4fa', color: '#1e1e2e', border: 'none',

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   DataBatch,
+  GraphTopology,
   InboundJsonMsg,
   OutboundMsg,
   StreamManifest,
@@ -10,9 +11,12 @@ import {
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
 
 interface UseWebSocketReturn {
-  status: ConnectionStatus
-  manifest: StreamManifest
-  send: (msg: OutboundMsg) => void
+  status:          ConnectionStatus
+  manifest:        StreamManifest
+  topology:        GraphTopology | null
+  topologyLoading: boolean
+  send:            (msg: OutboundMsg) => void
+  requestGraph:    () => void
   /** Register a handler for incoming data batches for a specific stream+field */
   onData: (stream: string, field: string, handler: (batch: DataBatch) => void) => () => void
 }
@@ -21,13 +25,14 @@ const WS_URL = `ws://${window.location.host}/ws`
 const RECONNECT_DELAY_MS = 2000
 
 export function useWebSocket(): UseWebSocketReturn {
-  const [status, setStatus] = useState<ConnectionStatus>('connecting')
-  const [manifest, setManifest] = useState<StreamManifest>({})
-  const wsRef = useRef<WebSocket | null>(null)
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [status,          setStatus]          = useState<ConnectionStatus>('connecting')
+  const [manifest,        setManifest]        = useState<StreamManifest>({})
+  const [topology,        setTopology]        = useState<GraphTopology | null>(null)
+  const [topologyLoading, setTopologyLoading] = useState(false)
 
-  // data handlers: key = "stream/field"
-  const dataHandlers = useRef<Map<string, Set<(b: DataBatch) => void>>>(new Map())
+  const wsRef           = useRef<WebSocket | null>(null)
+  const reconnectTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const dataHandlers    = useRef<Map<string, Set<(b: DataBatch) => void>>>(new Map())
 
   const connect = useCallback(() => {
     const ws = new WebSocket(WS_URL)
@@ -46,6 +51,7 @@ export function useWebSocket(): UseWebSocketReturn {
     ws.onclose = () => {
       console.warn('[WS] Disconnected — reconnecting in', RECONNECT_DELAY_MS, 'ms')
       setStatus('disconnected')
+      setTopologyLoading(false)
       reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS)
     }
 
@@ -56,18 +62,21 @@ export function useWebSocket(): UseWebSocketReturn {
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
-        // JSON control message
         try {
           const msg = JSON.parse(ev.data) as InboundJsonMsg
           if (msg.type === 'manifest') {
             console.info('[WS] Manifest received —', Object.keys(msg.streams).length, 'streams')
             setManifest(msg.streams)
+          } else if (msg.type === 'graph_topology') {
+            console.info('[WS] Graph topology received —',
+              msg.nodes.length, 'nodes,', msg.edges.length, 'edges')
+            setTopology({ nodes: msg.nodes, edges: msg.edges, streams: msg.streams })
+            setTopologyLoading(false)
           }
         } catch (err) {
           console.warn('[WS] Failed to parse JSON message:', err, ev.data)
         }
       } else if (ev.data instanceof ArrayBuffer) {
-        // Binary data message
         const batch = parseDataMessage(ev.data)
         if (batch) {
           const key = `${batch.stream}/${batch.field}`
@@ -99,6 +108,13 @@ export function useWebSocket(): UseWebSocketReturn {
     }
   }, [])
 
+  const requestGraph = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      setTopologyLoading(true)
+      wsRef.current.send(JSON.stringify({ type: 'get_graph' }))
+    }
+  }, [])
+
   const onData = useCallback(
     (stream: string, field: string, handler: (b: DataBatch) => void) => {
       const key = `${stream}/${field}`
@@ -113,5 +129,5 @@ export function useWebSocket(): UseWebSocketReturn {
     []
   )
 
-  return { status, manifest, send, onData }
+  return { status, manifest, topology, topologyLoading, send, requestGraph, onData }
 }

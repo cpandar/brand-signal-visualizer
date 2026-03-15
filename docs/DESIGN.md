@@ -108,8 +108,11 @@ real-time graph nodes (which typically run at priority 99).
 
 ## Frontend
 
-**Stack:** React + TypeScript, built with Vite, committed as a pre-built static bundle
-so users do not need `npm` to run the node. `npm` is a dev-time dependency only.
+**Stack:** React + TypeScript, built with Vite. The pre-built static bundle is committed
+so the node can run without Node.js at runtime. The frontend is rebuilt automatically
+during `make` via the node's `Makefile`, which is invoked by `brand/Makefile` as part of
+the normal build flow. `nodejs` and `npm` are therefore build-time dependencies, installed
+by `bootstrap.sh` / `bootstrap_mac.sh`.
 
 **Dashboard:** A free-form grid of viewer cards. Each card has:
 - A header showing stream name, field, current sample rate, and viewer type selector
@@ -285,5 +288,6 @@ The display node is designed to be a **rate-limited passive observer**:
   (`localStorage` is available since this is a standalone app, not an artifact.)
 - **Multi-field viewers**: Allow a single time series card to overlay multiple fields
   from the same stream (e.g. both `vel_x` and `vel_y` on one plot)?
-- **npm as dev dependency**: Is npm acceptable as a requirement for frontend development?
-  The pre-built bundle avoids it at runtime, but contributors modifying the frontend need it.
+- **npm as build dependency**: Resolved — `nodejs`/`npm` added to `bootstrap.sh` and
+  `bootstrap_mac.sh`; the node `Makefile` drives `npm install && npm run build`
+  automatically, with a sentinel file to skip rebuilds when sources are unchanged.
