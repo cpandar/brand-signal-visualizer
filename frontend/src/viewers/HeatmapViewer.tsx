@@ -216,7 +216,11 @@ export function HeatmapViewer({ config, registerDataHandler, windowSecs = 5 }: P
           let t: number
           if (isDemeaned) {
             const dev = colVals[ch] - ema[ch]
-            t = 0.5 + 0.5 * Math.max(-1, Math.min(1, dev / scale))
+            // tanh sigmoid: gain of 3 means a deviation of ~33% of the EMA
+            // range already maps to ~tanh(1)≈0.76, giving strong color; large
+            // outliers saturate smoothly rather than hard-clipping to max.
+            const GAIN = 3.0
+            t = 0.5 + 0.5 * Math.tanh((dev / scale) * GAIN)
           } else {
             t = Math.max(0, Math.min(1, colVals[ch] / scale))
           }
