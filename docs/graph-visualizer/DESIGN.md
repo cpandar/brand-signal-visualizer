@@ -103,38 +103,88 @@ static during a run.
 
 ### Latency Measurement
 
-Latency for a node is defined as:
+All measurements are derived purely from Redis stream entry IDs (millisecond
+timestamps) — no changes to existing BRAND nodes are required.
+
+#### Stream freshness (Phase 2a)
+
+For every stream in the topology:
+
+```
+freshness_ms = now_ms − latest_entry_id_ms
+```
+
+Freshness is the age of the most recent entry. Compared to the stream's expected
+inter-sample interval (`1000 / approx_rate_hz`), it indicates whether the producing
+node is currently running:
+
+| Freshness | Interpretation |
+|---|---|
+| < 2× interval | Healthy — node is running on schedule |
+| 2–10× interval | Stale — node may be slow or intermittent |
+| > 10× interval | Dead — node appears to have stopped |
+
+Freshness is displayed as a colored dot on each node box (green / yellow / red)
+and as a `ms` age label on each edge. It works for all node types including
+source nodes (output streams only) and sink/display nodes (input streams only),
+for which cross-stream latency is not computable.
+
+#### Processing latency (Phase 2b)
+
+For nodes with at least one input stream and one output stream:
 
 ```
 latency_ms = output_stream_id_ms − max(input_stream_id_ms)
 ```
 
-where `output_stream_id_ms` is the millisecond timestamp embedded in the latest
-Redis entry ID of the node's primary output stream, and `input_stream_id_ms` is
-the same for each of the node's input streams. For nodes with multiple inputs, the
-most recent input timestamp is used (the last input to arrive in that processing
-cycle).
+`output_stream_id_ms` is the Redis timestamp of the latest entry in the node's
+primary output stream. `input_stream_id_ms` is the same for each input stream;
+the maximum across inputs is used (the last input to arrive in that cycle).
 
-The `LatencyService` runs a background coroutine that:
+For multi-output nodes, latency is computed independently per output stream and
+the minimum is reported (the output produced soonest after input).
 
-1. Polls at ~10 Hz (every 100 ms) — much lower than the signal viewer's 60 Hz,
-   since latency distributions change slowly.
-2. For each node that has at least one known input stream and one output stream,
-   calls `XREVRANGE <stream> + - COUNT 1` for each relevant stream (one call per
-   stream, batched where possible).
-3. Computes the latency sample and appends it to a per-node ring buffer
-   (2 minutes × 10 Hz = 1 200 samples per node).
-4. Pushes a `latency_update` message to all connected WebSocket clients
-   subscribed to graph latency.
+**Node type handling:**
 
-Nodes with no detectable output streams (e.g. pure display nodes) are shown in the
-graph but have no latency panel.
+| Node type | Example | Latency measurable? |
+|---|---|---|
+| Transform (in → out) | bin_multiple, wiener_filter | Yes |
+| Source (out only) | mouseAdapter, thresholds_udp | No — freshness only |
+| Sink (in only) | display_centerOut | No — freshness only |
+| Batch (N in → 1 out) | bin_multiple (10:1) | Yes — includes accumulation window |
 
-**Limitations:** This method measures the lag between the timestamp embedded in the
-output Redis entry ID and the timestamps of the input entries. It is accurate to
-~1 ms (Redis ID resolution) but does not account for within-batch latency (a node
-may process several input samples per output entry). For neural decoding pipelines
-this is the most meaningful latency metric.
+**Limitations:** Accurate to ~1 ms (Redis ID resolution). For batch nodes, the
+reported latency includes the accumulation window (e.g. bin_multiple at 10 ms
+bins will report ~10 ms minimum), which is correct for end-to-end purposes but
+larger than the node's pure compute time.
+
+#### End-to-end / critical path latency (Phase 2b)
+
+The cumulative latency along the DAG's critical path (the path with the highest
+sum of per-edge latencies) is the clinically meaningful end-to-end delay — from
+raw neural data to decoder output. Displayed in the graph toolbar as:
+
+```
+critical path: 14.2 ms  [node_a → bin_multiple → wiener_filter]
+```
+
+#### Jitter (Phase 2b)
+
+For each output stream, the standard deviation of the last N inter-sample
+intervals is computed alongside latency. High jitter (relative to the mean
+interval) indicates OS scheduling variance or variable-length processing.
+
+### LatencyService
+
+A background asyncio coroutine running at ~10 Hz (100 ms interval):
+
+1. For each stream in the topology, calls `XREVRANGE <stream> + - COUNT 2`
+   (2 entries to compute the inter-sample interval).
+2. Computes `freshness_ms`, `latency_ms` (where applicable), and
+   `interval_std_ms` (jitter) per node.
+3. Appends latency samples to a per-node ring buffer
+   (2 min × 10 Hz = 1 200 samples).
+4. Pushes a `latency_update` WebSocket message to all subscribed clients.
 
 ### New WebSocket Messages
 
@@ -186,13 +236,26 @@ this is the most meaningful latency metric.
 ```json
 {
   "type": "latency_update",
-  "samples": {
-    "bin_multiple":   [12.3, 11.8, 13.1, 12.6],
-    "wiener_filter":  [5.2, 4.9, 5.0, 5.1]
+  "t": 1234567890.123,
+  "freshness": {
+    "binned_spikes":    3.1,
+    "threshold_values": 2.8
   },
-  "t": 1234567890.123
+  "latency": {
+    "bin_multiple":  12.3,
+    "wiener_filter":  5.2
+  },
+  "jitter": {
+    "bin_multiple":  0.4,
+    "wiener_filter": 0.1
+  },
+  "critical_path_ms":    17.4,
+  "critical_path_nodes": ["mouseAdapterSim", "thresholds_udp", "bin_multiple", "wiener_filter"]
 }
 ```
+
+Phase 2a sends the **latest** latency scalar per node. Phase 2b will extend this with
+the full ring-buffer history for use by `LatencyTrace` and `LatencyBoxPlot`.
 
 ---
 
@@ -226,28 +289,42 @@ An SVG-based layered DAG rendered inside a scrollable `div`. Layout algorithm:
 6. **Unknown sources/sinks**: streams with no detectable upstream/downstream node
    are rendered as small circular input/output ports at the graph boundary.
 
-Node boxes display: `nickname`, module short name, run_priority badge.
+Node boxes display: `nickname`, module short name, `machine` hostname, run_priority
+badge. Phase 2a adds a freshness dot (green/yellow/red) and Phase 2b adds a median
+latency badge (e.g. `8ms`). Edge labels show stream name (Phase 1) and latency
+(Phase 2b).
 
 ### Node Detail Panel (`NodeDetailPanel.tsx`)
 
-Slides in from the right when a node is clicked (or appears below the graph on
-narrow viewports). Contains three sections:
+Slides in from the right when a node is clicked. Contains:
+
+**Header** — nickname, module, machine, run_priority badge.
 
 **Streams I/O table**
 
-| Direction | Stream | Fields | dtype | Ch | Rate |
-|---|---|---|---|---|---|
-| ← in | `threshold_values` | `samples` | int8 | 192 | 1000 Hz |
-| → out | `binned_spikes` | `samples` | int8 | 192 | 100 Hz |
+| Direction | Stream | Fields | dtype | Ch | Rate | Freshness |
+|---|---|---|---|---|---|---|
+| ← in | `threshold_values` | `samples` | int8 | 192 | 1000 Hz | 1.2 ms ● |
+| → out | `binned_spikes` | `samples` | int8 | 192 | 100 Hz | 3.4 ms ● |
 
-**Latency trace** — a uPlot line chart showing the last 60 seconds of latency
-samples for this node (reuses the existing `TimeSeriesViewer` infrastructure but
-with synthetic `DataBatch` objects constructed from `latency_update` messages).
+(Phase 2a adds the Freshness column. Dot color follows green/yellow/red scale.)
 
-**Latency distribution** — an SVG box-and-whiskers plot over all retained samples
-(up to 2 minutes). Displays: min, p5, p25, median, p75, p95, max. A second
-overlay shows a thin violin/density estimate (kernel density, binned into 30
-buckets) alongside the box if enough samples are available (≥ 50).
+**Latency trace** (Phase 2b) — a uPlot line chart showing the last 60 seconds of
+per-node latency samples. Built using a lightweight uPlot instance with synthetic
+data constructed from `latency_update` messages (not a full `TimeSeriesViewer`).
+
+**Latency distribution** (Phase 2b) — SVG box-and-whiskers over all retained
+samples (up to 2 minutes). Displays: p5 whisker, p25 box edge, median line,
+p75 box edge, p95 whisker, plus individual outlier dots. A KDE curve is overlaid
+when ≥ 50 samples are available (kernel density, 30 buckets). X-axis in ms,
+auto-scaled to p99 × 1.1.
+
+**Jitter summary** (Phase 2b) — single-line stat bar: `median Xms · p95 Xms · jitter ±Xms`.
+
+### No-selection summary (Phase 2b)
+
+When no node is selected, the detail panel area shows a horizontal bar chart
+ranking all nodes by median latency — highlighting the bottleneck at a glance.
 
 ### Latency Distribution Chart (`LatencyBoxPlot.tsx`)
 
@@ -285,38 +362,51 @@ User closes panel / navigates away
 
 ## Implementation Plan
 
-### Phase 1 — Topology display (no latency)
+### Phase 1 — Topology display ✅ complete
 
-- [ ] Backend: `_build_graph_topology()` method — reads `supergraph_stream`,
-      scans Redis stream names, infers I/O via parameter heuristic, returns JSON
-- [ ] Backend: `get_graph` WebSocket handler
-- [ ] Frontend: `GraphPage.tsx` — tab navigation, holds graph state
-- [ ] Frontend: `GraphView.tsx` — SVG DAG with layered layout
-- [ ] Frontend: `NodeDetailPanel.tsx` — stream I/O table only
-- [ ] Tab bar in `App.tsx`
+- [x] Backend: `_build_graph_topology()` — reads `supergraph_stream`, scans Redis,
+      infers I/O via parameter key heuristic
+- [x] Backend: `get_graph` WebSocket handler with YAML format fallback
+- [x] Frontend: `GraphPage.tsx`, `GraphView.tsx` (SVG DAG), `NodeDetailPanel.tsx`
+- [x] Tab bar in `App.tsx`; `machine` field on node boxes and detail panel
 
-### Phase 2 — Latency measurement
+### Phase 2a — Stream freshness ✅ complete
 
-- [ ] Backend: `LatencyService` — 10 Hz polling coroutine, ring buffer
-- [ ] Backend: `subscribe_graph_latency` / `unsubscribe_graph_latency` handlers
-- [ ] Frontend: `LatencyBoxPlot.tsx` — SVG box-and-whiskers + KDE
-- [ ] Frontend: `LatencyTrace` — uPlot running line (adapt existing TimeSeriesViewer)
-- [ ] Wire latency panels into `NodeDetailPanel`
+- [x] Backend: `_latency_loop()` coroutine at 10 Hz — computes `freshness_ms` per
+      stream via `XREVRANGE count=2`; sends `latency_update` with freshness dict
+- [x] Backend: `subscribe_graph_latency` / `unsubscribe_graph_latency` handlers
+- [x] Frontend: freshness dot on each node box (green/yellow/red)
+- [x] Frontend: freshness age label on each DAG edge
+- [x] Frontend: Age column in NodeDetailPanel streams table
+- [x] Frontend: critical path latency in GraphPage toolbar
+- [x] Frontend: display refresh rate control — URL param `?refreshMs=N` (default 600 ms)
+      plus a numeric input in the toolbar; updates URL via `replaceState` so the
+      setting survives page reload
+- [x] Frontend: scroll-fade indicator on NodeDetailPanel streams table — a right-edge
+      gradient overlay appears whenever the table overflows horizontally, and fades out
+      once the user scrolls to the end
+
+### Phase 2b — Processing latency history
+
+- [ ] Backend: extend `LatencyService` with per-node latency computation,
+      ring buffer (1 200 samples), jitter (interval std dev), critical path sum
+- [ ] Frontend: `LatencyTrace` — lightweight uPlot line chart in NodeDetailPanel
+- [ ] Frontend: `LatencyBoxPlot.tsx` — SVG box-and-whiskers + KDE overlay
+- [ ] Frontend: jitter stat bar in NodeDetailPanel
+- [ ] Frontend: critical path latency in GraphPage toolbar
+- [ ] Frontend: no-selection summary bar chart (all nodes ranked by median latency)
+- [ ] Frontend: latency ms badge on node boxes; latency label on edges
 
 ### Phase 3 — Polish
 
-- [ ] Handle unknown sources/sinks gracefully (boundary ports)
-- [ ] Highlight edges for the selected node
-- [ ] Aggregate latency box-and-whiskers for all nodes in a summary view
-- [ ] Auto-refresh topology if `supergraph_stream` changes (detect via stream ID)
+- [ ] Handle unknown sources/sinks gracefully (boundary ports on graph edge)
+- [ ] Auto-refresh topology when `supergraph_stream` gets a new entry
+- [ ] Edge latency coloring (green/yellow/red alongside stream name label)
 
 ---
 
 ## Open Questions
 
-- **supergraph_stream field key**: The exact field name within the Redis stream entry
-  that holds the YAML string needs to be verified against the supervisor's write code.
-  Working assumption: field name is `data` or the graph nickname.
 - **Parameter heuristic accuracy**: For nodes with non-standard parameter naming, the
   stream-name matching heuristic may miss connections or produce false edges. A
   `graph_hints` top-level YAML section (analogous to `display_hints`) could allow
@@ -326,3 +416,11 @@ User closes panel / navigates away
   "primary" (lowest latency? highest rate? first listed?).
 - **Supervisor node**: The supervisor itself may appear as a node in the topology.
   Should it be shown, hidden, or rendered differently?
+
+## Resolved
+
+- **supergraph_stream field key**: The supervisor stores the graph YAML as a
+  JSON-encoded string in the `data` field of the `supergraph_stream` entry (i.e.
+  the value is a JSON string whose content is YAML text — double-encoded). The
+  backend applies a three-format fallback: (a) JSON → dict directly, (b) JSON →
+  string → `yaml.safe_load()`, (c) raw bytes → `yaml.safe_load()`.

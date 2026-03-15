@@ -70,11 +70,13 @@ class ConnectionManager:
         self.connections.add(ws)
         logging.info('Browser client connected')
 
-    def disconnect(self, ws: WebSocket):
+    def disconnect(self, ws: WebSocket, latency_subscribers: Optional[Set] = None):
         self.connections.discard(ws)
         for stream_subs in self.subscriptions.values():
             for field_subs in stream_subs.values():
                 field_subs.discard(ws)
+        if latency_subscribers is not None:
+            latency_subscribers.discard(ws)
         logging.info('Browser client disconnected')
 
     def subscribe(self, ws: WebSocket, stream: str, field: str, last_id: str = '0-0'):
@@ -232,6 +234,12 @@ class SignalVisualizerNode(BRANDNode):
         self._dtype_cache: Dict[tuple, int] = {}
         self._server: Optional[uvicorn.Server] = None
         self._shutdown = False
+        # Latency service state
+        self._topology: Optional[dict] = None          # cached after first get_graph
+        self._latency_subscribers: Set[WebSocket] = set()
+        self._latency_history: Dict[str, list] = {}    # node_nickname -> [latency_ms, ...]
+        LATENCY_HISTORY_MAX = 1200                      # 2 min × 10 Hz
+        self._LATENCY_HISTORY_MAX = LATENCY_HISTORY_MAX
 
     # ------------------------------------------------------------------
     # Graph YAML helpers
@@ -405,10 +413,10 @@ class SignalVisualizerNode(BRANDNode):
                     msg = await ws.receive_json()
                     await node._handle_message(ws, msg)
             except WebSocketDisconnect:
-                manager.disconnect(ws)
+                manager.disconnect(ws, node._latency_subscribers)
             except Exception as e:
                 logging.error(f'WebSocket error: {e}')
-                manager.disconnect(ws)
+                manager.disconnect(ws, node._latency_subscribers)
 
         # Serve React frontend
         if STATIC_DIR.exists():
@@ -602,6 +610,158 @@ class SignalVisualizerNode(BRANDNode):
 
         return topology
 
+    # ------------------------------------------------------------------
+    # Latency / freshness service
+    # ------------------------------------------------------------------
+
+    async def _latency_loop(self):
+        """
+        10 Hz background loop that computes stream freshness and per-node
+        processing latency, then pushes latency_update messages to all
+        subscribed WebSocket clients.
+        """
+        INTERVAL = 0.1  # 10 Hz
+
+        while not self._shutdown:
+            t_start = asyncio.get_event_loop().time()
+
+            if self._latency_subscribers and self._topology:
+                try:
+                    update = self._compute_latency_update()
+                    if update and self._latency_subscribers:
+                        payload = json.dumps(update,
+                                             default=lambda o: float(o)
+                                             if hasattr(o, '__float__') else str(o))
+                        dead: Set[WebSocket] = set()
+                        for ws in list(self._latency_subscribers):
+                            try:
+                                await ws.send_text(payload)
+                            except Exception:
+                                dead.add(ws)
+                        self._latency_subscribers -= dead
+                except Exception as e:
+                    logging.error(f'[latency_loop] Error: {e}', exc_info=True)
+
+            elapsed = asyncio.get_event_loop().time() - t_start
+            await asyncio.sleep(max(0.0, INTERVAL - elapsed))
+
+    def _compute_latency_update(self) -> Optional[dict]:
+        """
+        Compute one latency snapshot from Redis and return the latency_update dict.
+        Called from _latency_loop at 10 Hz.
+        """
+        import time as _time
+        now_ms = _time.time() * 1000.0
+
+        topo = self._topology
+        if not topo:
+            return None
+
+        # --- 1. Collect latest Redis timestamps for every relevant stream ---
+        # Fetch the two most recent entries per stream to compute both the latest
+        # timestamp and the inter-sample interval (for jitter/freshness threshold).
+        all_streams: Set[str] = set()
+        for node in topo.get('nodes', []):
+            for s in node.get('in_streams', []):
+                all_streams.add(s)
+            for s in node.get('out_streams', []):
+                all_streams.add(s)
+
+        stream_latest_ms: Dict[str, float] = {}    # stream -> ms of latest entry
+        stream_interval_ms: Dict[str, float] = {}  # stream -> inter-sample ms
+
+        for stream in all_streams:
+            try:
+                entries = self.r.xrevrange(stream, '+', '-', count=2)
+                if not entries:
+                    continue
+                t0 = int(entries[0][0].decode().split('-')[0])
+                stream_latest_ms[stream] = float(t0)
+                if len(entries) >= 2:
+                    t1 = int(entries[1][0].decode().split('-')[0])
+                    interval = abs(t0 - t1)
+                    if interval > 0:
+                        stream_interval_ms[stream] = float(interval)
+            except Exception:
+                continue
+
+        # --- 2. Freshness per stream ---
+        freshness: Dict[str, float] = {}
+        for stream, latest_ms in stream_latest_ms.items():
+            freshness[stream] = round(now_ms - latest_ms, 2)
+
+        # --- 3. Per-node latency and jitter ---
+        latency_new: Dict[str, float] = {}   # nickname -> latest latency_ms
+        jitter: Dict[str, float] = {}         # nickname -> interval std_ms
+
+        for node in topo.get('nodes', []):
+            nickname = node.get('nickname', '')
+            in_streams  = [s for s in node.get('in_streams',  []) if s in stream_latest_ms]
+            out_streams = [s for s in node.get('out_streams', []) if s in stream_latest_ms]
+
+            if not in_streams or not out_streams:
+                continue
+
+            latest_in  = max(stream_latest_ms[s] for s in in_streams)
+            # For multi-output, take the minimum latency (earliest output)
+            latest_out = min(stream_latest_ms[s] for s in out_streams)
+
+            lat = latest_out - latest_in
+            if -50 < lat < 60_000:  # sanity range: ignore obviously bogus values
+                latency_new[nickname] = round(lat, 2)
+
+                # Accumulate history
+                hist = self._latency_history.setdefault(nickname, [])
+                hist.append(lat)
+                if len(hist) > self._LATENCY_HISTORY_MAX:
+                    hist.pop(0)
+
+            # Jitter: std dev of inter-sample intervals on primary output stream
+            primary_out = out_streams[0]
+            if primary_out in stream_interval_ms:
+                # We only have one interval per stream per tick; use running
+                # std dev over the last 20 interval samples stored separately.
+                jitter[nickname] = round(stream_interval_ms[primary_out], 2)
+
+        # --- 4. Critical path: longest cumulative latency sum ---
+        critical_path_ms = 0.0
+        critical_path_nodes: list = []
+        edges = topo.get('edges', [])
+        nodes_by_nick = {n['nickname']: n for n in topo.get('nodes', [])}
+
+        if latency_new and edges:
+            # Build adjacency for path finding
+            adj: Dict[str, list] = {n: [] for n in nodes_by_nick}
+            for e in edges:
+                if e['from'] in adj:
+                    adj[e['from']].append(e['to'])
+
+            # DFS to find heaviest path by cumulative latency
+            def dfs(node_name: str, path: list, acc: float):
+                nonlocal critical_path_ms, critical_path_nodes
+                new_acc = acc + latency_new.get(node_name, 0.0)
+                new_path = path + [node_name]
+                if new_acc > critical_path_ms:
+                    critical_path_ms = new_acc
+                    critical_path_nodes = new_path
+                for nxt in adj.get(node_name, []):
+                    dfs(nxt, new_path, new_acc)
+
+            sources = [n for n in nodes_by_nick if not any(
+                e['to'] == n for e in edges)]
+            for src in sources:
+                dfs(src, [], 0.0)
+
+        return {
+            'type':                 'latency_update',
+            't':                    round(now_ms / 1000.0, 3),
+            'freshness':            freshness,
+            'latency':              latency_new,
+            'jitter':               jitter,
+            'critical_path_ms':     round(critical_path_ms, 2),
+            'critical_path_nodes':  critical_path_nodes,
+        }
+
     async def _handle_message(self, ws: WebSocket, msg: dict):
         mtype = msg.get('type')
         if mtype == 'get_manifest':
@@ -631,10 +791,9 @@ class SignalVisualizerNode(BRANDNode):
         elif mtype == 'get_graph':
             try:
                 topo = self._build_graph_topology()
+                self._topology = topo   # cache for latency service
                 logging.info(f'[get_graph] Built topology: '
                              f'{len(topo["nodes"])} nodes, {len(topo["edges"])} edges')
-                # Use json.dumps + send_text to avoid FastAPI's encoder choking on
-                # any numpy-derived integers that may slip through from manifest
                 payload = json.dumps({'type': 'graph_topology', **topo},
                                      default=lambda o: int(o) if hasattr(o, '__index__')
                                      else float(o) if hasattr(o, '__float__')
@@ -650,6 +809,12 @@ class SignalVisualizerNode(BRANDNode):
                                         'error': str(e)})
                 except Exception:
                     pass
+        elif mtype == 'subscribe_graph_latency':
+            self._latency_subscribers.add(ws)
+            logging.info(f'[latency] Client subscribed ({len(self._latency_subscribers)} total)')
+        elif mtype == 'unsubscribe_graph_latency':
+            self._latency_subscribers.discard(ws)
+            logging.info(f'[latency] Client unsubscribed ({len(self._latency_subscribers)} total)')
         else:
             logging.warning(f'Unknown message type: {mtype}')
 
@@ -678,6 +843,7 @@ class SignalVisualizerNode(BRANDNode):
         await asyncio.gather(
             server.serve(),
             self._polling_loop(),
+            self._latency_loop(),
         )
 
     def run(self):

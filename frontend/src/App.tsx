@@ -9,7 +9,10 @@ let nextId = 1
 type Page = 'signals' | 'graph'
 
 export function App() {
-  const { status, manifest, topology, topologyLoading, send, requestGraph, onData } = useWebSocket()
+  const {
+    status, manifest, topology, topologyLoading, latency,
+    send, requestGraph, subscribeGraphLatency, unsubscribeGraphLatency, onData,
+  } = useWebSocket()
   const [viewers,        setViewers]        = useState<ViewerConfig[]>([])
   const [showAddDialog,  setShowAddDialog]  = useState(false)
   const [activePage,     setActivePage]     = useState<Page>('signals')
@@ -107,7 +110,10 @@ export function App() {
         <GraphPage
           topology={topology}
           topologyLoading={topologyLoading}
+          latency={latency}
           requestGraph={requestGraph}
+          subscribeGraphLatency={subscribeGraphLatency}
+          unsubscribeGraphLatency={unsubscribeGraphLatency}
         />
       )}
 

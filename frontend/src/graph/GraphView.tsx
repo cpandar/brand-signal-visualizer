@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import { GraphEdge, GraphNode, GraphTopology } from '../types'
+import { GraphEdge, GraphNode, GraphTopology, LatencyUpdate } from '../types'
 
 // Layout constants
 const NODE_W       = 200
@@ -23,10 +23,8 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]): LayoutResult {
 
   const nicknames = nodes.map(n => n.nickname)
 
-  // 1. Build adjacency and in-degree for topological sort
   const adj      = new Map<string, string[]>(nicknames.map(n => [n, []]))
   const inDegree = new Map<string, number>(nicknames.map(n => [n, 0]))
-
   for (const e of edges) {
     if (adj.has(e.from) && adj.has(e.to)) {
       adj.get(e.from)!.push(e.to)
@@ -34,7 +32,6 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]): LayoutResult {
     }
   }
 
-  // 2. Kahn's topological sort
   const queue = nicknames.filter(n => (inDegree.get(n) ?? 0) === 0)
   const order: string[] = []
   while (queue.length > 0) {
@@ -46,12 +43,8 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]): LayoutResult {
       if (d === 0) queue.push(next)
     }
   }
-  // Append any nodes not reached (back-edges / cycles)
-  for (const n of nicknames) {
-    if (!order.includes(n)) order.push(n)
-  }
+  for (const n of nicknames) { if (!order.includes(n)) order.push(n) }
 
-  // 3. Layer assignment: critical path depth
   const layer = new Map<string, number>(nicknames.map(n => [n, 0]))
   for (const n of order) {
     for (const next of adj.get(n) ?? []) {
@@ -60,7 +53,6 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]): LayoutResult {
     }
   }
 
-  // 4. Group nodes by layer
   const layers = new Map<number, string[]>()
   for (const n of nicknames) {
     const l = layer.get(n) ?? 0
@@ -68,19 +60,13 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]): LayoutResult {
     layers.get(l)!.push(n)
   }
 
-  // 5. Single-pass barycentric within-layer ordering to reduce crossings
   const sortedLayerNums = [...layers.keys()].sort((a, b) => a - b)
   for (let li = 1; li < sortedLayerNums.length; li++) {
     const layerNodes = layers.get(sortedLayerNums[li])!
     const prevLayer  = layers.get(sortedLayerNums[li - 1])!
     const prevIdx    = new Map(prevLayer.map((n, i) => [n, i]))
-
-    // Build reverse edges for barycentric
-    const revAdj = new Map<string, string[]>(nicknames.map(n => [n, []]))
-    for (const e of edges) {
-      revAdj.get(e.to)?.push(e.from)
-    }
-
+    const revAdj     = new Map<string, string[]>(nicknames.map(n => [n, []]))
+    for (const e of edges) { revAdj.get(e.to)?.push(e.from) }
     layerNodes.sort((a, b) => {
       const avgPos = (n: string) => {
         const preds = revAdj.get(n)?.filter(p => prevIdx.has(p)) ?? []
@@ -91,11 +77,9 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]): LayoutResult {
     })
   }
 
-  // 6. Assign pixel coordinates — center each layer vertically
   const maxLayerSize = Math.max(...[...layers.values()].map(l => l.length))
   const totalH       = maxLayerSize * V_STRIDE
   const positions    = new Map<string, NodePos>()
-
   for (const [l, layerNodes] of layers.entries()) {
     const x       = l * LAYER_STRIDE + MARGIN
     const offsetY = Math.round((totalH - layerNodes.length * V_STRIDE) / 2)
@@ -107,8 +91,30 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]): LayoutResult {
   const maxLayer  = Math.max(...[...layer.values()])
   const svgWidth  = (maxLayer + 1) * LAYER_STRIDE + MARGIN * 2 + NODE_W
   const svgHeight = totalH + MARGIN * 2
-
   return { positions, svgWidth, svgHeight }
+}
+
+// ---------------------------------------------------------------------------
+// Freshness helpers
+// ---------------------------------------------------------------------------
+
+function freshnessColor(ageMs: number | undefined, intervalMs: number): string {
+  if (ageMs === undefined) return '#45475a'
+  if (ageMs < intervalMs * 2)  return '#a6e3a1'  // green  — healthy
+  if (ageMs < intervalMs * 10) return '#f9e2af'  // yellow — stale
+  return '#f38ba8'                                // red    — dead
+}
+
+function fmtAge(ms: number): string {
+  if (ms < 1000)  return `${Math.round(ms)}ms`
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
+  return `>${Math.floor(ms / 60000)}m`
+}
+
+function streamInterval(topology: GraphTopology, stream: string): number {
+  const fields = topology.streams[stream]
+  const f = fields ? Object.values(fields)[0] : null
+  return f?.approx_rate_hz ? 1000 / f.approx_rate_hz : 100
 }
 
 // ---------------------------------------------------------------------------
@@ -116,11 +122,12 @@ function computeLayout(nodes: GraphNode[], edges: GraphEdge[]): LayoutResult {
 // ---------------------------------------------------------------------------
 
 function EdgePath({
-  from, to, label, positions, highlight,
+  edge, positions, highlight, latency, topology,
 }: {
-  from: string; to: string; label: string
-  positions: Map<string, NodePos>; highlight: boolean
+  edge: GraphEdge; positions: Map<string, NodePos>; highlight: boolean
+  latency: LatencyUpdate | null; topology: GraphTopology
 }) {
+  const { from, to, stream } = edge
   const a = positions.get(from)
   const b = positions.get(to)
   if (!a || !b) return null
@@ -133,26 +140,37 @@ function EdgePath({
   const midX = (x1 + x2) / 2
   const midY = (y1 + y2) / 2
 
-  const color = highlight ? '#89b4fa' : '#45475a'
+  const ageMs      = latency?.freshness?.[stream]
+  const intervalMs = streamInterval(topology, stream)
+  const fColor     = freshnessColor(ageMs, intervalMs)
+  const edgeColor  = highlight ? '#89b4fa' : '#45475a'
+  const labelText  = ageMs !== undefined
+    ? fmtAge(ageMs)
+    : stream.length > 12 ? stream.slice(0, 11) + '…' : stream
 
   return (
     <g>
       <defs>
         <marker id={`arrow-${from}-${to}`} markerWidth="8" markerHeight="8"
           refX="6" refY="3" orient="auto">
-          <path d="M0,0 L0,6 L8,3 z" fill={color} />
+          <path d="M0,0 L0,6 L8,3 z" fill={edgeColor} />
         </marker>
       </defs>
-      <path d={d} fill="none" stroke={color} strokeWidth={highlight ? 2 : 1.5}
+      <path d={d} fill="none" stroke={edgeColor} strokeWidth={highlight ? 2 : 1.5}
         markerEnd={`url(#arrow-${from}-${to})`} />
-      {/* Stream name label */}
-      <rect x={midX - 36} y={midY - 8} width={72} height={14}
-        rx={3} fill="#181825" opacity={0.85} />
+      {/* Label background */}
+      <rect x={midX - 28} y={midY - 8} width={56} height={14}
+        rx={3} fill="#181825" opacity={0.9} />
+      {/* Age label (or stream name before first latency update) */}
       <text x={midX} y={midY + 4} textAnchor="middle"
-        fontSize={9} fill={highlight ? '#89b4fa' : '#6c7086'}
+        fontSize={9} fill={latency ? fColor : '#6c7086'}
         fontFamily="monospace">
-        {label.length > 14 ? label.slice(0, 13) + '…' : label}
+        {labelText}
       </text>
+      {/* Freshness dot */}
+      {latency && (
+        <circle cx={midX + 32} cy={midY} r={4} fill={fColor} opacity={0.9} />
+      )}
     </g>
   )
 }
@@ -162,15 +180,31 @@ function EdgePath({
 // ---------------------------------------------------------------------------
 
 function NodeBox({
-  node, pos, selected, onClick,
+  node, pos, selected, latency, topology, onClick,
 }: {
-  node: GraphNode; pos: NodePos; selected: boolean; onClick: () => void
+  node: GraphNode; pos: NodePos; selected: boolean
+  latency: LatencyUpdate | null; topology: GraphTopology
+  onClick: () => void
 }) {
-  const priority = node.run_priority ?? 0
+  const priority      = node.run_priority ?? 0
   const priorityColor = priority >= 90 ? '#f38ba8' : priority >= 50 ? '#f9e2af' : '#a6e3a1'
-  const moduleShort = node.module.split('/').pop() ?? node.module
-  const machine = node.machine || 'local'
-  const machineColor = node.machine ? '#89dceb' : '#585b70'  // cyan if remote, dim if local
+  const moduleShort   = node.module.split('/').pop() ?? node.module
+  const machine       = node.machine || 'local'
+  const machineColor  = node.machine ? '#89dceb' : '#585b70'
+
+  // Freshness dot: worst (stalest) output stream, fall back to input for sink nodes
+  let dotColor = '#313244'  // dim — no latency data yet
+  if (latency) {
+    const watchStreams = node.out_streams.length > 0 ? node.out_streams : node.in_streams
+    const ages = watchStreams
+      .map(s => latency.freshness?.[s])
+      .filter((v): v is number => v !== undefined)
+    if (ages.length > 0) {
+      const worstAge    = Math.max(...ages)
+      const intervalMs  = Math.max(...watchStreams.map(s => streamInterval(topology, s)))
+      dotColor          = freshnessColor(worstAge, intervalMs)
+    }
+  }
 
   return (
     <g onClick={onClick} style={{ cursor: 'pointer' }}>
@@ -202,10 +236,13 @@ function NodeBox({
         {machine.length > 24 ? machine.slice(0, 23) + '…' : machine}
       </text>
       {/* Priority badge */}
-      <text x={pos.x + NODE_W - 8} y={pos.y + 16} fontSize={9} textAnchor="end"
+      <text x={pos.x + NODE_W - 18} y={pos.y + 16} fontSize={9} textAnchor="end"
         fill={priorityColor} fontFamily="monospace">
         p{priority}
       </text>
+      {/* Freshness dot (top-right corner) */}
+      <circle cx={pos.x + NODE_W - 7} cy={pos.y + 14} r={5}
+        fill={dotColor} opacity={0.95} />
       {/* I/O port dots */}
       {node.in_streams.length  > 0 &&
         <circle cx={pos.x} cy={pos.y + NODE_H / 2} r={4} fill="#45475a" stroke="#6c7086" strokeWidth={1} />}
@@ -220,12 +257,13 @@ function NodeBox({
 // ---------------------------------------------------------------------------
 
 interface Props {
-  topology:       GraphTopology
-  selectedNode:   string | null
-  onSelectNode:   (nickname: string) => void
+  topology:     GraphTopology
+  latency:      LatencyUpdate | null
+  selectedNode: string | null
+  onSelectNode: (nickname: string) => void
 }
 
-export function GraphView({ topology, selectedNode, onSelectNode }: Props) {
+export function GraphView({ topology, latency, selectedNode, onSelectNode }: Props) {
   const { positions, svgWidth, svgHeight } = useMemo(
     () => computeLayout(topology.nodes, topology.edges),
     [topology]
@@ -244,17 +282,17 @@ export function GraphView({ topology, selectedNode, onSelectNode }: Props) {
       <svg width={svgWidth} height={svgHeight}
         style={{ display: 'block', background: '#11111b' }}>
 
-        {/* Edges (drawn first, behind nodes) */}
         {topology.edges.map((e, i) => (
           <EdgePath
             key={i}
-            from={e.from} to={e.to} label={e.stream}
+            edge={e}
             positions={positions}
             highlight={selectedNode === e.from || selectedNode === e.to}
+            latency={latency}
+            topology={topology}
           />
         ))}
 
-        {/* Nodes */}
         {topology.nodes.map(node => {
           const pos = positions.get(node.nickname)
           if (!pos) return null
@@ -264,6 +302,8 @@ export function GraphView({ topology, selectedNode, onSelectNode }: Props) {
               node={node}
               pos={pos}
               selected={selectedNode === node.nickname}
+              latency={latency}
+              topology={topology}
               onClick={() => onSelectNode(node.nickname)}
             />
           )

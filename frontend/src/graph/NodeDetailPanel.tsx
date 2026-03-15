@@ -1,12 +1,70 @@
-import { GraphNode, GraphTopology } from '../types'
+import { useEffect, useRef, useState } from 'react'
+import { GraphNode, GraphTopology, LatencyUpdate } from '../types'
+
+function freshnessColor(ageMs: number | undefined, rateHz: number): string {
+  if (ageMs === undefined) return '#585b70'
+  const interval = 1000 / (rateHz || 10)
+  if (ageMs < interval * 2)  return '#a6e3a1'
+  if (ageMs < interval * 10) return '#f9e2af'
+  return '#f38ba8'
+}
+
+function fmtAge(ms: number): string {
+  if (ms < 1000)  return `${Math.round(ms)}ms`
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
+  return `>${Math.floor(ms / 60000)}m`
+}
+
+/** Wraps a horizontally-scrollable element and shows a right-edge fade when there is more to scroll. */
+function ScrollFadeWrapper({ children }: { children: React.ReactNode }) {
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [fadeVisible, setFadeVisible] = useState(false)
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+
+    function check() {
+      if (!el) return
+      // Show fade when there is content to the right of the visible area
+      setFadeVisible(el.scrollWidth > el.clientWidth + 1 && el.scrollLeft < el.scrollWidth - el.clientWidth - 1)
+    }
+
+    check()
+    el.addEventListener('scroll', check)
+    const ro = new ResizeObserver(check)
+    ro.observe(el)
+    return () => {
+      el.removeEventListener('scroll', check)
+      ro.disconnect()
+    }
+  }, [])
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <div ref={scrollRef} style={{ overflowX: 'auto' }}>
+        {children}
+      </div>
+      {/* Fade overlay — pointer-events:none so it doesn't block clicks */}
+      <div style={{
+        position: 'absolute', top: 0, right: 0, bottom: 0, width: 48,
+        background: 'linear-gradient(to right, transparent, #1e1e2e)',
+        pointerEvents: 'none',
+        opacity: fadeVisible ? 1 : 0,
+        transition: 'opacity 150ms ease',
+      }} aria-hidden />
+    </div>
+  )
+}
 
 interface Props {
   node:     GraphNode
   topology: GraphTopology
+  latency:  LatencyUpdate | null
   onClose:  () => void
 }
 
-export function NodeDetailPanel({ node, topology, onClose }: Props) {
+export function NodeDetailPanel({ node, topology, latency, onClose }: Props) {
   const allStreams = [
     ...node.in_streams.map(s  => ({ s, dir: 'in'  as const })),
     ...node.out_streams.map(s => ({ s, dir: 'out' as const })),
@@ -55,68 +113,84 @@ export function NodeDetailPanel({ node, topology, onClose }: Props) {
       {streams.length === 0
         ? <div style={styles.empty}>No streams detected</div>
         : (
-          <table style={styles.table}>
-            <thead>
-              <tr>
-                <th style={styles.th}></th>
-                <th style={styles.th}>Stream</th>
-                <th style={styles.th}>Fields</th>
-                <th style={styles.th}>dtype</th>
-                <th style={styles.th}>Ch</th>
-                <th style={styles.th}>Rate</th>
-              </tr>
-            </thead>
-            <tbody>
-              {streams.map(({ s, dir }) => {
-                const schema = topology.streams[s]
-                const fields = schema ? Object.entries(schema) : []
-                return fields.length > 0
-                  ? fields.map(([fname, info], fi) => (
-                    <tr key={`${s}-${fname}`} style={fi === 0 ? styles.rowFirst : styles.row}>
-                      {fi === 0 && (
-                        <>
-                          <td style={styles.tdDir} rowSpan={fields.length}>
-                            <span style={{
-                              ...styles.dirBadge,
-                              background: dir === 'in' ? '#1e3a2e' : '#1e2a3e',
-                              color:      dir === 'in' ? '#a6e3a1' : '#89b4fa',
-                            }}>
-                              {dir === 'in' ? '← in' : '→ out'}
-                            </span>
+          <ScrollFadeWrapper>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={styles.th}></th>
+                  <th style={styles.th}>Stream</th>
+                  <th style={styles.th}>Fields</th>
+                  <th style={styles.th}>dtype</th>
+                  <th style={styles.th}>Ch</th>
+                  <th style={styles.th}>Rate</th>
+                  <th style={styles.th}>Age</th>
+                </tr>
+              </thead>
+              <tbody>
+                {streams.map(({ s, dir }) => {
+                  const schema = topology.streams[s]
+                  const fields = schema ? Object.entries(schema) : []
+                  return fields.length > 0
+                    ? fields.map(([fname, info], fi) => (
+                      <tr key={`${s}-${fname}`} style={fi === 0 ? styles.rowFirst : styles.row}>
+                        {fi === 0 && (
+                          <>
+                            <td style={styles.tdDir} rowSpan={fields.length}>
+                              <span style={{
+                                ...styles.dirBadge,
+                                background: dir === 'in' ? '#1e3a2e' : '#1e2a3e',
+                                color:      dir === 'in' ? '#a6e3a1' : '#89b4fa',
+                              }}>
+                                {dir === 'in' ? '← in' : '→ out'}
+                              </span>
+                            </td>
+                            <td style={styles.tdStream} rowSpan={fields.length}>
+                              {s}
+                            </td>
+                          </>
+                        )}
+                        <td style={styles.td}>{fname}</td>
+                        <td style={styles.td}>{info.dtype}</td>
+                        <td style={styles.td}>{info.n_channels}</td>
+                        <td style={styles.td}>
+                          {info.approx_rate_hz > 0 ? `~${info.approx_rate_hz} Hz` : '—'}
+                        </td>
+                        {fi === 0 && (
+                          <td style={styles.td} rowSpan={fields.length}>
+                            {(() => {
+                              const ageMs = latency?.freshness?.[s]
+                              const color = freshnessColor(ageMs, info.approx_rate_hz)
+                              return (
+                                <span style={{ color, fontFamily: 'monospace', fontSize: 11 }}>
+                                  {ageMs !== undefined ? fmtAge(ageMs) : '—'}
+                                </span>
+                              )
+                            })()}
                           </td>
-                          <td style={styles.tdStream} rowSpan={fields.length}>
-                            {s}
-                          </td>
-                        </>
-                      )}
-                      <td style={styles.td}>{fname}</td>
-                      <td style={styles.td}>{info.dtype}</td>
-                      <td style={styles.td}>{info.n_channels}</td>
-                      <td style={styles.td}>
-                        {info.approx_rate_hz > 0 ? `~${info.approx_rate_hz} Hz` : '—'}
-                      </td>
-                    </tr>
-                  ))
-                  : (
-                    <tr key={s} style={styles.rowFirst}>
-                      <td style={styles.tdDir}>
-                        <span style={{
-                          ...styles.dirBadge,
-                          background: dir === 'in' ? '#1e3a2e' : '#1e2a3e',
-                          color:      dir === 'in' ? '#a6e3a1' : '#89b4fa',
-                        }}>
-                          {dir === 'in' ? '← in' : '→ out'}
-                        </span>
-                      </td>
-                      <td style={styles.tdStream}>{s}</td>
-                      <td style={{ ...styles.td, color: '#6c7086' }} colSpan={4}>
-                        not active in Redis
-                      </td>
-                    </tr>
-                  )
-              })}
-            </tbody>
-          </table>
+                        )}
+                      </tr>
+                    ))
+                    : (
+                      <tr key={s} style={styles.rowFirst}>
+                        <td style={styles.tdDir}>
+                          <span style={{
+                            ...styles.dirBadge,
+                            background: dir === 'in' ? '#1e3a2e' : '#1e2a3e',
+                            color:      dir === 'in' ? '#a6e3a1' : '#89b4fa',
+                          }}>
+                            {dir === 'in' ? '← in' : '→ out'}
+                          </span>
+                        </td>
+                        <td style={styles.tdStream}>{s}</td>
+                        <td style={{ ...styles.td, color: '#6c7086' }} colSpan={5}>
+                          not active in Redis
+                        </td>
+                      </tr>
+                    )
+                })}
+              </tbody>
+            </table>
+          </ScrollFadeWrapper>
         )
       }
 

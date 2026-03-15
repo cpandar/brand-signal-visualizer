@@ -69,8 +69,12 @@ export interface GetManifestMsg { type: 'get_manifest' }
 export interface SubscribeMsg   { type: 'subscribe';   stream: string; field: string }
 export interface UnsubscribeMsg { type: 'unsubscribe'; stream: string; field: string }
 
-export interface GetGraphMsg    { type: 'get_graph' }
-export type OutboundMsg = GetManifestMsg | SubscribeMsg | UnsubscribeMsg | GetGraphMsg
+export interface GetGraphMsg             { type: 'get_graph' }
+export interface SubscribeGraphLatency   { type: 'subscribe_graph_latency' }
+export interface UnsubscribeGraphLatency { type: 'unsubscribe_graph_latency' }
+export type OutboundMsg =
+  | GetManifestMsg | SubscribeMsg | UnsubscribeMsg
+  | GetGraphMsg | SubscribeGraphLatency | UnsubscribeGraphLatency
 
 // ---------------------------------------------------------------------------
 // WebSocket message types received FROM backend
@@ -87,7 +91,18 @@ export interface SubscribedMsg {
 }
 
 export interface GraphTopologyMsg extends GraphTopology { type: 'graph_topology' }
-export type InboundJsonMsg = ManifestMsg | SubscribedMsg | GraphTopologyMsg
+
+export interface LatencyUpdate {
+  type:                 'latency_update'
+  t:                    number                      // unix seconds
+  freshness:            Record<string, number>      // stream -> age_ms
+  latency:              Record<string, number>      // node_nickname -> latest_ms
+  jitter:               Record<string, number>      // node_nickname -> interval_std_ms
+  critical_path_ms:     number
+  critical_path_nodes:  string[]
+}
+
+export type InboundJsonMsg = ManifestMsg | SubscribedMsg | GraphTopologyMsg | LatencyUpdate
 
 // ---------------------------------------------------------------------------
 // Dtype helpers

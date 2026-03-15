@@ -3,6 +3,7 @@ import {
   DataBatch,
   GraphTopology,
   InboundJsonMsg,
+  LatencyUpdate,
   OutboundMsg,
   StreamManifest,
   parseDataMessage,
@@ -11,12 +12,15 @@ import {
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
 
 interface UseWebSocketReturn {
-  status:          ConnectionStatus
-  manifest:        StreamManifest
-  topology:        GraphTopology | null
-  topologyLoading: boolean
-  send:            (msg: OutboundMsg) => void
-  requestGraph:    () => void
+  status:                 ConnectionStatus
+  manifest:               StreamManifest
+  topology:               GraphTopology | null
+  topologyLoading:        boolean
+  latency:                LatencyUpdate | null
+  send:                   (msg: OutboundMsg) => void
+  requestGraph:           () => void
+  subscribeGraphLatency:  () => void
+  unsubscribeGraphLatency: () => void
   /** Register a handler for incoming data batches for a specific stream+field */
   onData: (stream: string, field: string, handler: (batch: DataBatch) => void) => () => void
 }
@@ -29,6 +33,7 @@ export function useWebSocket(): UseWebSocketReturn {
   const [manifest,        setManifest]        = useState<StreamManifest>({})
   const [topology,        setTopology]        = useState<GraphTopology | null>(null)
   const [topologyLoading, setTopologyLoading] = useState(false)
+  const [latency,         setLatency]         = useState<LatencyUpdate | null>(null)
 
   const wsRef           = useRef<WebSocket | null>(null)
   const reconnectTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -72,6 +77,8 @@ export function useWebSocket(): UseWebSocketReturn {
               msg.nodes.length, 'nodes,', msg.edges.length, 'edges')
             setTopology({ nodes: msg.nodes, edges: msg.edges, streams: msg.streams })
             setTopologyLoading(false)
+          } else if (msg.type === 'latency_update') {
+            setLatency(msg)
           }
         } catch (err) {
           console.warn('[WS] Failed to parse JSON message:', err, ev.data)
@@ -115,6 +122,18 @@ export function useWebSocket(): UseWebSocketReturn {
     }
   }, [])
 
+  const subscribeGraphLatency = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'subscribe_graph_latency' }))
+    }
+  }, [])
+
+  const unsubscribeGraphLatency = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'unsubscribe_graph_latency' }))
+    }
+  }, [])
+
   const onData = useCallback(
     (stream: string, field: string, handler: (b: DataBatch) => void) => {
       const key = `${stream}/${field}`
@@ -129,5 +148,8 @@ export function useWebSocket(): UseWebSocketReturn {
     []
   )
 
-  return { status, manifest, topology, topologyLoading, send, requestGraph, onData }
+  return {
+    status, manifest, topology, topologyLoading, latency,
+    send, requestGraph, subscribeGraphLatency, unsubscribeGraphLatency, onData,
+  }
 }
