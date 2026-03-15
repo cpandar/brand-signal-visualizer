@@ -360,6 +360,50 @@ User closes panel / navigates away
 
 ---
 
+## Signal Viewer — notable implementation details
+
+The signal viewer (the original page, predating the graph view) has several
+non-obvious behaviors worth noting for future contributors.
+
+### Viewer data pipeline (no React state intermediary)
+
+Each viewer (`TimeSeriesViewer`, `HeatmapViewer`, `RasterViewer`) calls
+`registerDataHandler(stream, field, handler)` at mount time. The handler is
+invoked synchronously on every incoming WebSocket batch and pushes data directly
+into a mutable `useRef` buffer — it never calls `setState`. The render loop
+(`requestAnimationFrame` for heatmap/raster, `plot.setData()` for timeseries)
+reads from the ref at display rate. This avoids React 18 state-batching, which
+would drop intermediate frames when data arrives faster than the render cycle.
+
+### Multi-field timeseries alignment
+
+When multiple single-channel fields (e.g. `vel_x` + `vel_y`) are overlaid on
+one timeseries viewer, each field has its own subscription and arrives in
+separate WebSocket messages. Alignment is handled by a `pendingRef` map keyed
+on Redis entry timestamp (ms). Because all fields in a single BRAND Redis entry
+share the same entry ID, timestamps match exactly and entries flush the instant
+all fields are present — no resampling or interpolation needed.
+
+### Heatmap buffer vs. display window
+
+The heatmap buffer retains `MAX_BUFFER_SECS = 60` seconds of column history,
+trimmed by wall-clock time (not by column count). The render loop slices to the
+visible window (`windowSecs`) at draw time. `maxCols` is computed dynamically
+from `rate × MAX_BUFFER_SECS × 1.5` (floor 6000) so high-rate streams (100 Hz+)
+always have enough columns to fill a 30 s window.
+
+### Demeaned heatmap colormap and gain
+
+The demeaned (Δ mean) mode applies:
+1. Per-channel EMA subtraction (τ = 10 s, `alpha = 1 / (rate × 10)`)
+2. `tanh((dev / devMax) × GAIN)` with `GAIN = 3` — a sigmoidal mapping that
+   amplifies small deviations (~30% of range → ~76% color intensity) while
+   softly saturating large outliers
+3. A dark-center diverging LUT ("fusion"): near-black at zero, azure at −max,
+   red-orange at +max — chosen so near-zero channels recede into the dark UI
+
+---
+
 ## Implementation Plan
 
 ### Phase 1 — Topology display ✅ complete
